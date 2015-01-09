@@ -1,10 +1,12 @@
 #!/usr/bin/python
 import logging
-# logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger('main')
+import argparse
+import sys
 import json
 import urllib
-# import dnspython
+import requests
 
 from helpers import load, save
 from oauth2.auth import Authenticator
@@ -34,11 +36,32 @@ class gmailInfo(object):
 		self.prefs = self._prefs
 		self.msgs = self._msgs
 	
-	def getMessage(self):
+	def getDomainsFromMsg(self, msgId, domains = None):
+		"""docstring for getDomainsFromMsg"""
+		data = self.getMessage(msgId)
+		domains = domains or {}
+		if 'payload' in data:
+			if 'headers' in data['payload']:
+				old_mail = None
+				for header in data['payload']['headers']:
+					mail = header.get('value').rstrip('>') # example@gmail.com
+					if mail != old_mail: # de-duplication
+						domain = mail[(mail.index('@')+1)::] # gmail.com
+						# TODO: fix counters, if sender == x-original-sender
+						if domain in domains:
+							domains[domain]['count'] += 1 # increment counter
+						else:
+							domains[domain] = {'count': 1} # initialize dict
+					else:
+						logger.info('Found duplicate: ' + str(data['payload']['headers']))
+					old_mail = mail
+		return domains
+
+	def getMessage(self, msgId):
 		"""docstring for getMessage"""
 		logger.info('Retrieving message: ' + str(msgId))
 		
-		url = 'https://www.googleapis.com/gmail/v1/users/{0}/messages/{1}'.format(userId, msgId)
+		url = 'https://www.googleapis.com/gmail/v1/users/{0}/messages/{1}'.format(self.userId, msgId)
 		params = {
 			'format': 'metadata',
 			'metadataHeaders': ['Sender','X-Original-Sender']
@@ -46,19 +69,9 @@ class gmailInfo(object):
 		url += '?' + urllib.urlencode(params, doseq=True)
 		logger.info('URL:' + url)
 		
-		result = auth.signedRequest(url, userId)
+		result = self.auth.signedRequest(url, self.userId)
 		data = result.json()
-		
-		if 'payload' in data:
-			if 'headers' in data['payload']:
-				for header in data['payload']['headers']:
-					mail = header.get('value').rstrip('>') # example@gmail.com
-					domain = mail[(mail.index('@')+1)::] # gmail.com
-					# TODO: fix counters, if sender == x-original-sender
-					if domain in domains:
-						domains[domain]['count'] += 1 # increment counter
-					else:
-						domains[domain] = {'count': 1} # initialize dict
+		return data
 	
 	def listMessages(self):
 		"""docstring for listMessages"""
@@ -111,14 +124,55 @@ class gmailInfo(object):
 		self._msgs = val
 		return save(val, self.file_msgs)
 
+def queryMX(domain):
+	url = 'http://api.statdns.com/{0}/mx'.format(domain)
+	r = requests.get(url)
+	if r.status_code == requests.codes.ok:
+		result = r.json()
+		records = {}
+		if 'answer' in result:
+			for record in result['answer']:
+				rdata = record.get('rdata', '').split(' ')
+				weight = rdata[0]
+				hostname = rdata[1]
+				if weight and hostname:
+					records[hostname] = {'weight': weight}
+		if 'additional' in result:
+			for record in result['additional']:
+				recordType = record.get('type')
+				hostname = record.get('name')
+				# A-record holding IPv4 for host in records
+				if recordType == 'A' and hostname in records:
+					address = record.get('rdata')
+					records[hostname].update({
+						'address': address
+					})
+		return records
+
 def main():
 	"""docstring for main"""
-	inf = gmailInfo('jan@almeroth.com')
-	prefs = inf.prefs
-	messages = inf.msgs
-	# inf.listMessages()
+	# initialize Arg-parser
+	parser = argparse.ArgumentParser()
+	# setup Arg-parser
+	parser.add_argument('-u', '--user', type=str, help='User ID')
+	# initialize args
+	args = sys.argv[1:]
+	# parse arguments
+	args, unknown = parser.parse_known_args(args)
+	logger.debug("args: " + str(args) + " unknown: " + str(unknown))
 	
-	print len(messages)
+	if args.user:
+		inf = gmailInfo(args.user)
+		domains = {}
+		for msg in inf.msgs:
+			domains = inf.getDomainsFromMsg(msg.get('id'), domains)
+		print json.dumps(domains)
+		for domain in domains:
+			domains[domain]['records'] = queryMX(domain)
+		print json.dumps(domains)
 	
 if __name__ == '__main__':
-	main()
+	try:
+		main()
+	except (KeyboardInterrupt, SystemExit):
+		print "Quitting."
